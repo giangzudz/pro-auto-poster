@@ -16,3 +16,9 @@ accounts.json
 posted.json
 groups.json
 config.json
+
+build/
+dist/
+*.spec
+*.msix
+*.exe
