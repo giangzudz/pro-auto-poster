@@ -23,7 +23,9 @@ import urllib.parse
 from html.parser import HTMLParser
 
 from core.accounts import BASE_DIR
+from core.cookie_parser import parse_cookie_string
 from core.facebook_client import FacebookClient
+from core.proxy import parse_proxy
 
 try:
     import requests
@@ -113,7 +115,7 @@ def _parse_forms(page_html):
 
 # ---------------- client ----------------
 class RequestsFacebookClient(FacebookClient):
-    def __init__(self, account):
+    def __init__(self, account, proxy=None):
         super().__init__(account)
         _require_requests()
         self.session = requests.Session()
@@ -124,6 +126,36 @@ class RequestsFacebookClient(FacebookClient):
         username = (account or {}).get("username", "default")
         safe = re.sub(r"[^a-zA-Z0-9_-]", "_", str(username))
         self.cookies_path = os.path.join(BASE_DIR, f"cookies_{safe}.json")
+        self.proxy = None
+        if proxy:
+            self.set_proxy(proxy)
+
+    # ---------- proxy ----------
+    def set_proxy(self, proxy):
+        """Gán proxy cho mọi request (nhận mọi định dạng của parse_proxy).
+        Trả về URL chuẩn đã dùng. Ví dụ: "1.2.3.4:8080:user:pass"."""
+        url = parse_proxy(proxy)
+        if url.startswith("socks"):
+            try:
+                import socks  # noqa: F401  (PySocks)
+            except ImportError:
+                raise FacebookError(
+                    'Proxy SOCKS cần cài thêm: pip install "requests[socks]"')
+        self.proxy = url
+        self.session.proxies = {"http": url, "https": url}
+        return url
+
+    def test_proxy(self, timeout=10):
+        """Kiểm tra proxy sống không + xem IP hiện tại.
+        Trả về {'ok': True, 'ip': ..., 'latency_ms': ...}."""
+        t0 = time.time()
+        try:
+            r = self.session.get("https://api.ipify.org?format=json", timeout=timeout)
+            r.raise_for_status()
+            ip = r.json().get("ip", "?")
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "ip": ip, "latency_ms": int((time.time() - t0) * 1000)}
 
     # ---------- tiện ích ----------
     @staticmethod
@@ -215,12 +247,44 @@ class RequestsFacebookClient(FacebookClient):
         raise LoginRequired("Chưa đăng nhập. Hãy nhập Email/Mật khẩu rồi bấm "
                             "'Đăng nhập & lưu cookies'.")
 
+    def import_cookies(self, cookie_string):
+        """Nhập cookies từ chuỗi copy ở trình duyệt (nhiều định dạng).
+        Không cần email/mật khẩu. Ném FacebookError nếu cookies không hợp lệ."""
+        parsed = parse_cookie_string(cookie_string)
+        jar = self.session.cookies
+        # Xóa cookies facebook cũ để tránh lẫn với bộ mới
+        for cookie in list(jar):
+            if "facebook" in (cookie.domain or ""):
+                jar.clear(domain=cookie.domain, path=cookie.path, name=cookie.name)
+        for c in parsed:
+            jar.set_cookie(requests.cookies.create_cookie(
+                c["name"], c["value"],
+                domain=c.get("domain") or ".facebook.com",
+                path=c.get("path") or "/",
+            ))
+        if not self._is_logged_in():
+            raise FacebookError(
+                "Cookies không hợp lệ: thiếu cookie c_user "
+                "(trình duyệt copy từ chưa đăng nhập Facebook?).")
+        self.save_cookies()
+        return True
+
     # ---------- FacebookClient API ----------
     def login(self, email=None, password=None):
         """Đăng nhập 1 lần để lấy cookies (mật khẩu không được lưu lại)."""
         if not email or not password:
             raise LoginFailed("Thiếu email hoặc mật khẩu.")
-        home = self._get(MBASIC)
+        try:
+            home = self._get(MBASIC)
+        except Exception as exc:  # noqa: BLE001
+            raise FacebookError(
+                "Không tải được trang đăng nhập Facebook. Nguyên nhân thường gặp: "
+                "IP này bị Facebook chặn ngay từ cổng (rất hay xảy ra với IP "
+                "datacenter như Google Colab) — lúc này còn chưa tới bước kiểm tra "
+                "email/mật khẩu. Thử dùng proxy residential:\n"
+                '  client.set_proxy("http://user:pass@host:port")\n'
+                "rồi login lại, hoặc đăng nhập từ mạng gia đình."
+            ) from exc
         form = self._find_login_form(_parse_forms(home.text))
         if form is None:
             if self._is_logged_in():  # đã login sẵn (ít gặp)

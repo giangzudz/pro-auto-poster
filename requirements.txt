@@ -1,4 +1,5 @@
 requests>=2.31.0
+# Proxy SOCKS (nếu dùng socks5://...): pip install "requests[socks]"
 
 # Chạy thử:  python3 main.py
 #

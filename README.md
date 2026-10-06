@@ -42,6 +42,9 @@ ui/
 Lưu ý:
 - Nếu Facebook yêu cầu xác minh (checkpoint), app báo lỗi và dừng —
   hãy mở trình duyệt thật để xác minh rồi đăng nhập lại. App không tự vượt checkpoint/captcha.
+- **Đăng nhập bằng cookies (khuyên dùng):** trên trình duyệt đã đăng nhập Facebook,
+  dùng tiện ích Cookie-Editor → Export (Header String / JSON) hoặc Get cookies.txt,
+  rồi bấm "🍪 Nhập cookies từ trình duyệt" trong app và dán vào. Không cần nhập mật khẩu.
 - Đăng kèm ảnh/video qua requests chưa hỗ trợ (app sẽ báo lỗi rõ ràng).
 - Form/selector của Facebook có thể đổi theo thời gian; các điểm mong manh được gom
   trong `core/fb_requests_client.py` (các hàm `_find_*`) để dễ chỉnh.
@@ -71,12 +74,34 @@ Lưu ý: IP của Colab là IP datacenter nên Facebook dễ yêu cầu checkpoi
 khi đăng nhập; dữ liệu `~/.proautoposter` mất khi runtime ngắt (dùng cell
 Google Drive trong notebook để giữ lại).
 
+## Đóng gói thành app Windows (.exe)
+
+Cách nhanh nhất: double-click file `build_windows.bat` (tự cài PyInstaller và build).
+File `.exe` sẽ nằm ở `dist\ProAutoPoster.exe` — copy đi đâu cũng chạy được,
+không cần cài Python trên máy đó.
+
+Làm tay:
+```bat
+pip install pyinstaller requests
+pyinstaller --noconfirm --onefile --windowed --name "ProAutoPoster" main.py
+```
+
+Lưu ý:
+- Phải build trên Windows mới ra file `.exe` chạy trên Windows.
+- File `.exe` khoảng 30-50MB (đã gồm Python + tkinter + requests bên trong).
+- App PyInstaller đôi khi bị antivirus báo nhầm (false positive) — thêm vào
+  whitelist là được.
+- Dữ liệu app vẫn lưu ở `%USERPROFILE%\.proautoposter`.
+
 ## Roadmap
 
 - [x] `FacebookClient` thật: login bằng cookies/session, `post_to_group`, `comment` qua requests (text)
 - [x] Quét UID thành viên nhóm (`scan_group_uids`)
 - [x] API check trạng thái tài khoản (`check_account_status`)
+- [x] Hỗ trợ proxy v4/v6 cho RequestsFacebookClient (parse nhiều định dạng, set_proxy, test_proxy)
 - [ ] Đăng kèm ảnh/video qua requests
+- [x] Đăng nhập bằng cookies (paste chuỗi cookies nhiều định dạng: Netscape/JSON/Header)
+- [ ] UI nhập proxy cố định theo tài khoản (desktop)
 - [ ] API check nội dung comment, check link, get info nâng cao
 - [ ] Tích hợp Golike (giữ nguyên interface `FacebookClient`, UI/Scheduler không phải sửa)
 - [x] Hoàn thiện tab Auto Comment (quét bài đã đăng → comment up bài theo vòng)

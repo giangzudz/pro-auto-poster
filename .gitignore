@@ -3,6 +3,15 @@ __pycache__/
 *.py[cod]
 *.pyo
 
+# PyInstaller build artifacts (chỉ build ở máy local, không đẩy lên git)
+build/
+dist/
+*.spec
+
+# File cài đặt / rác
+*.msix
+*.exe
+
 # Hệ điều hành / editor
 .DS_Store
 Thumbs.db
@@ -16,9 +25,3 @@ accounts.json
 posted.json
 groups.json
 config.json
-
-build/
-dist/
-*.spec
-*.msix
-*.exe

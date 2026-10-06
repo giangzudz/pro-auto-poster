@@ -181,6 +181,8 @@ class MainWindow:
         self.ent_fb_pass.pack(fill="x", pady=2)
         make_button(acc_box, "🔐 Đăng nhập & lưu cookies", "#1f6feb",
                     self._fb_login).pack(fill="x", pady=2)
+        make_button(acc_box, "🍪 Nhập cookies từ trình duyệt", "#6d28d9",
+                    self._import_cookies).pack(fill="x", pady=2)
 
         set_box = section(self.left, "THÔNG SỐ CHẠY")
         set_box.pack(fill="x", pady=(0, 8))
@@ -758,6 +760,49 @@ class MainWindow:
         messagebox.showinfo("Đăng nhập FB",
                             "Đăng nhập thành công, cookies đã được lưu.\n"
                             "Các lần sau không cần nhập lại mật khẩu.")
+
+    def _import_cookies(self):
+        if not _HAS_FB_REQUESTS:
+            messagebox.showerror("Thiếu thư viện",
+                                 "Cần cài 'requests' trước:\n\npip install requests")
+            return
+        username = self.cbo_profile.get()
+        win = tk.Toplevel(self.root)
+        win.title("Nhập cookies Facebook")
+        win.geometry("580x440")
+        win.configure(bg=BG)
+        tk.Label(
+            win,
+            text="Dán chuỗi cookies copy từ trình duyệt đã đăng nhập Facebook\n"
+                 "(tiện ích Cookie-Editor: Export -> Header String / JSON, "
+                 "hoặc Get cookies.txt):",
+            bg=BG, fg=MUTED, font=("Segoe UI", 10), justify="left"
+        ).pack(anchor="w", padx=10, pady=(10, 4))
+        txt = tk.Text(win, bg=FIELD, fg=TEXT, relief="flat",
+                      font=("Consolas", 10), wrap="word", height=15,
+                      insertbackground=TEXT)
+        txt.pack(fill="both", expand=True, padx=10)
+        txt.focus_set()
+
+        def _save():
+            raw = txt.get("1.0", "end-1c")
+            try:
+                RequestsFacebookClient(
+                    self.accounts.get(username)).import_cookies(raw)
+            except Exception as exc:  # noqa: BLE001 - hiển thị lỗi cho user
+                messagebox.showerror("Cookies không hợp lệ", str(exc))
+                return
+            self.accounts.touch_login(username)
+            self.log.success(f"Đã nhập cookies cho '{username}'.")
+            messagebox.showinfo("Nhập cookies", "Đã lưu cookies thành công!")
+            win.destroy()
+
+        btnrow = tk.Frame(win, bg=BG)
+        btnrow.pack(fill="x", padx=10, pady=10)
+        make_button(btnrow, "💾 Lưu cookies", "#1f6feb", _save).pack(
+            side="left", padx=(0, 6))
+        make_button(btnrow, "Hủy", "#33333f", win.destroy, fg=MUTED).pack(
+            side="left")
 
     def _build_client(self):
         """Trả về (client, mô tả chế độ) hoặc (None, None) nếu chưa đủ điều kiện."""

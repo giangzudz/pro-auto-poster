@@ -9,7 +9,7 @@ echo [1/2] Cai dat pyinstaller...
 pip install pyinstaller requests
 
 echo [2/2] Dang build, cho mot chut...
-pyinstaller --noconfirm --onefile --windowed --name "ProAutoPoster" main.py
+python -m PyInstaller --noconfirm --onefile --windowed --name "ProAutoPoster" main.py
 
 echo.
 echo ============================================================
