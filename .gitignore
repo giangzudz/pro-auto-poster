@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Hệ điều hành / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Đề phòng: không đẩy nhầm dữ liệu nhạy cảm (cookies, tài khoản)
+# (mặc định các file này nằm ở ~/.proautoposter, ngoài repo)
+cookies_*.json
+accounts.json
+posted.json
+groups.json
+config.json
