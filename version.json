@@ -1,1 +1,5 @@
-{"notes":"Thêm chế độ 'Thật (Trình duyệt)': điều khiển Chromium thật bằng Playwright trên www.facebook.com (vượt mọi lớp kiểm tra client khi HTTP bị chặn). Dùng chung cookies với chế độ Requests. Cần: pip install playwright + playwright install chromium.","sha256":"","version":"1.5.0"}
+{
+  "notes": "Tu xu ly dialog Chan trang ca nhan de tuong tac cua Facebook (moi bai chi cho 1 profile tuong tac): tu tat dialog va bao ro trong log thay vi treo/timeout.",
+  "sha256": "",
+  "version": "1.8.1"
+}

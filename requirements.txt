@@ -1,4 +1,10 @@
 requests>=2.31.0
+# Giả lập TLS/HTTP2 của Chrome thật để qua lớp kiểm tra client của Facebook
+# (nếu thiếu, app vẫn chạy bằng requests nhưng dễ bị chặn):
+curl_cffi
+# Chế độ "Thật (Trình duyệt)": điều khiển Chromium thật (bắt buộc khi Facebook
+# chặn toàn bộ client HTTP). Cài thêm: playwright install chromium
+playwright
 # Proxy SOCKS (nếu dùng socks5://...): pip install "requests[socks]"
 
 # Chạy thử:  python3 main.py

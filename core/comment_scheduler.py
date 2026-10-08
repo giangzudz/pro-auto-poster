@@ -18,6 +18,9 @@ class CommentJob:
     rounds: int = 3
     delay_min: int = 30
     delay_max: int = 90
+    use_fanpage: bool = False
+    rotate_voice: bool = False
+    auto_like: bool = False
 
 
 class CommentScheduler:
@@ -75,10 +78,35 @@ class CommentScheduler:
                                  "round": rnd}
                     msg = spinner.render(job.comment, variables)
                     try:
-                        client.comment(pid, msg)
-                        self.log.success(
-                            f"[{op}/{total}] Đã up bài {p.get('group_name') or pid} "
-                            f"(vòng {rnd})")
+                        pname = p.get('group_name') or pid
+                        if job.auto_like:
+                            lresult = client.like(
+                                pid, use_fanpage=job.use_fanpage,
+                                rotate_voice=job.rotate_voice)
+                            if isinstance(lresult, dict) and lresult.get("already"):
+                                self.log.info(f"[{op}/{total}] Bài {pname} đã like từ trước.")
+                            else:
+                                self.log.success(f"[{op}/{total}] Đã like bài {pname}.")
+                            if isinstance(lresult, dict) and lresult.get("as_page"):
+                                self.log.info(
+                                    "↳ Like với tư cách Fanpage: "
+                                    f"{lresult['as_page']}.")
+                        if msg.strip():
+                            cresult = client.comment(pid, msg,
+                                                     use_fanpage=job.use_fanpage,
+                                                     rotate_voice=job.rotate_voice)
+                            self.log.success(
+                                f"[{op}/{total}] Đã up bài {pname} (vòng {rnd})")
+                            if isinstance(cresult, dict) and cresult.get("as_page"):
+                                self.log.info(
+                                    "↳ Bình luận với tư cách Fanpage: "
+                                    f"{cresult['as_page']}.")
+                            elif job.use_fanpage:
+                                err = (cresult.get("fanpage_error")
+                                       if isinstance(cresult, dict) else "")
+                                self.log.warning(
+                                    f"↳ Không chuyển được sang Fanpage ({err}), "
+                                    "đã bình luận bằng nick cá nhân.")
                         if on_commented:
                             on_commented(pid)
                     except Exception as exc:  # noqa: BLE001 - ghi log mọi lỗi runtime

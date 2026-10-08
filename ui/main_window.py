@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
 """Cửa sổ chính PRO AUTO POSTER - Tkinter dark theme, bám sát ảnh thiết kế."""
+import functools
 import json
 import os
+import re
+import threading
 import tkinter as tk
+import traceback
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from core.accounts import BASE_DIR, AccountManager, get_hwid
@@ -10,6 +14,9 @@ from core.app_log import AppLog
 from core.comment_scheduler import CommentJob, CommentScheduler
 from core.facebook_client import MockFacebookClient
 from core.posted_store import PostedStore
+from core.proxy import parse_proxy
+from core.updater import (apply_update, check_update, get_local_version,
+                          is_frozen, restart_app)
 
 try:
     from core.fb_requests_client import FacebookError, RequestsFacebookClient
@@ -18,6 +25,16 @@ except Exception:  # noqa: BLE001 - app vẫn chạy ở chế độ Mock nếu 
     FacebookError = Exception
     RequestsFacebookClient = None
     _HAS_FB_REQUESTS = False
+try:
+    from core.fb_requests_client import HTTP_ENGINE
+except Exception:  # noqa: BLE001
+    HTTP_ENGINE = "requests"
+try:
+    from core.fb_playwright_client import PlaywrightFacebookClient
+    _HAS_PLAYWRIGHT = True
+except Exception:  # noqa: BLE001 - thiếu playwright thì ẩn chế độ trình duyệt
+    PlaywrightFacebookClient = None
+    _HAS_PLAYWRIGHT = False
 from core.scheduler import PostJob, Scheduler
 from core.spintax import Spintax
 
@@ -45,6 +62,21 @@ def make_button(parent, text, bg, command=None, fg="white"):
     )
 
 
+def _guard(fn):
+    """Bọc các hàm xử lý nút bấm: lỗi không còn 'chết im' mà hiện ra log app."""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return fn(self, *args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.log.error(f"Lỗi ở '{fn.__name__}': {exc}")
+            except Exception:  # noqa: BLE001
+                pass
+            traceback.print_exc()
+    return wrapper
+
+
 def section(parent, title):
     return tk.LabelFrame(
         parent, text=f"  {title}  ", bg=PANEL, fg=ACCENT,
@@ -54,16 +86,89 @@ def section(parent, title):
     )
 
 
+def _resolve_short_link(url):
+    """Theo redirect cua link rut gon (facebook.com/share/..., fb.me, fb.watch)
+    de lay URL that co chua post ID. That bai thi tra ve URL goc."""
+    low = (url or "").lower()
+    if not any(k in low for k in ("/share/", "fb.me/", "fb.watch")):
+        return url
+    try:
+        import requests
+        headers = {
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/120.0.0.0 Safari/537.36"),
+        }
+        for method in ("head", "get"):
+            try:
+                r = getattr(requests, method)(
+                    url, allow_redirects=True, timeout=10, headers=headers)
+                final = (r.url or "").strip()
+                if final and final != url and "facebook.com" in final:
+                    return final
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    return url
+
+
+def _short_id(post_id):
+    """Rut gon ID/URL de hien thi trong danh sach."""
+    s = str(post_id or "")
+    return s if len(s) <= 24 else s[:21] + "..."
+
+
+def _guess_label_from_url(url):
+    """Doan ten goi nho tu link: facebook.com/<ten>/posts/... -> <ten>."""
+    m = re.search(r"facebook\.com/([^/?#]+)/", url or "")
+    if m:
+        seg = m.group(1)
+        if seg not in ("groups", "photo.php", "story.php", "watch", "reel",
+                       "videos", "posts", "permalink"):
+            return seg
+    return "Bài viết"
+
+
+def _extract_post_id_from_url(url):
+    """Tach post ID tu link Facebook hoac ID thuan.
+
+    Tra ve (post_id, ten_goi_nho). Khong tach duoc -> (None, "")."""
+    url = (url or "").strip()
+    if re.fullmatch(r"\d+", url):
+        return url, ""
+    url = _resolve_short_link(url)
+    # link pfbid (ID ma hoa, khong phai so): giu nguyen URL day du de mo truc tiep
+    if re.search(r"pfbid[A-Za-z0-9]+", url):
+        return url, _guess_label_from_url(url)
+    base = re.split(r"[?#]", url, maxsplit=1)[0].rstrip("/")
+    for pat in (r"/posts/(\d+)", r"/permalink/(\d+)",
+                r"[?&]fbid=(\d+)", r"story_fbid=(\d+)",
+                r"/videos/(\d+)", r"/reel/(\d+)"):
+        m = re.search(pat, url)
+        if m:
+            return m.group(1), _guess_label_from_url(url)
+    m = re.search(r"/(\d{6,})/?$", base)
+    if m:
+        return m.group(1), _guess_label_from_url(url)
+    return None, ""
+
+
 class MainWindow:
     def __init__(self, root):
         self.root = root
-        root.title("PRO AUTO POSTER - Phần Mềm Tự Động Đăng Bài & Bình Luận Facebook")
+        root.title(f"PRO AUTO POSTER v{get_local_version()} - Tu Dong Dang Bai & Binh Luan Facebook")
         root.geometry("1280x800")
         root.configure(bg=BG)
         root.minsize(1100, 700)
 
         # ---------- state ----------
         self.log = AppLog()
+        if _HAS_FB_REQUESTS and HTTP_ENGINE == "requests":
+            self.log.warning(
+                "Chưa cài 'curl_cffi' — Facebook có thể chặn kết nối "
+                "(báo 'Trình duyệt này không hỗ trợ'). "
+                "Cài bằng: pip install curl_cffi")
         self.accounts = AccountManager()
         self.spintax = Spintax()
         self.scheduler = Scheduler(self.log)
@@ -78,6 +183,8 @@ class MainWindow:
         self.var_headless = tk.BooleanVar(value=False)
         self.var_auto_comment = tk.BooleanVar(value=True)
         self.var_fanpage = tk.BooleanVar(value=False)
+        self.var_rotate_voice = tk.BooleanVar(value=False)
+        self.var_auto_like = tk.BooleanVar(value=False)
         self.var_c_rounds = tk.IntVar(value=3)
         self.var_c_delay_min = tk.IntVar(value=30)
         self.var_c_delay_max = tk.IntVar(value=90)
@@ -85,7 +192,7 @@ class MainWindow:
         self._build_header()
         self._build_body()
 
-        self.log.success("Hệ thống PRO AUTO POSTER 2.0 đã sẵn sàng.")
+        self.log.success(f"Hệ thống PRO AUTO POSTER v{get_local_version()} đã sẵn sàng.")
         acc = self.accounts.get("testcho")
         if acc:
             self.log.info(
@@ -134,7 +241,42 @@ class MainWindow:
 
     # ================= left =================
     def _build_left(self):
-        acc_box = section(self.left, "TÀI KHOẢN & PROFILE")
+        # Panel trai: phan cai dat cuon doc duoc; cum nut + o "Che do"
+        # ghim co dinh o day panel de luc nao cung bam duoc.
+        # LUU Y: phai pack bottom TRUOC canvas (packer chia o theo thu tu pack,
+        # pack sau se bi chiem het cho va bien mat).
+        bottom = tk.Frame(self.left, bg=BG)
+        bottom.pack(side="bottom", fill="x", pady=(6, 0))
+
+        canvas = tk.Canvas(self.left, bg=BG, highlightthickness=0)
+        vsb = tk.Scrollbar(self.left, orient="vertical", command=canvas.yview,
+                           troughcolor=BG, bg=PANEL, activebackground=FIELD,
+                           relief="flat", borderwidth=0)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = tk.Frame(canvas, bg=BG)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(win, width=e.width))
+
+        def _on_wheel(e):
+            # chi cuon panel trai khi chuot dang o tren no
+            # (touchpad hay gui delta nho -> lam tron toi thieu 1 nac)
+            x, y = self.left.winfo_pointerx(), self.left.winfo_pointery()
+            lx, ly = self.left.winfo_rootx(), self.left.winfo_rooty()
+            if (lx <= x <= lx + self.left.winfo_width()
+                    and ly <= y <= ly + self.left.winfo_height()):
+                units = int(-1 * (e.delta / 120))
+                if units == 0:
+                    units = -1 if e.delta > 0 else 1
+                canvas.yview_scroll(units, "units")
+                return "break"
+        canvas.bind_all("<MouseWheel>", _on_wheel, add="+")
+        acc_box = section(inner, "TÀI KHOẢN & PROFILE")
         acc_box.pack(fill="x", pady=(0, 8))
 
         self.lbl_user = tk.Label(acc_box, text="User: -", bg=PANEL, fg=TEXT,
@@ -183,8 +325,29 @@ class MainWindow:
                     self._fb_login).pack(fill="x", pady=2)
         make_button(acc_box, "🍪 Nhập cookies từ trình duyệt", "#6d28d9",
                     self._import_cookies).pack(fill="x", pady=2)
+        self.btn_update = make_button(acc_box, "🔄 Kiểm tra cập nhật", "#0e7490",
+                                      self._check_update)
+        self.btn_update.pack(fill="x", pady=2)
 
-        set_box = section(self.left, "THÔNG SỐ CHẠY")
+        tk.Label(acc_box, text="Proxy riêng (để trống = không dùng):", bg=PANEL,
+                 fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w", pady=(6, 2))
+        self.ent_proxy = tk.Entry(acc_box, bg=FIELD, fg=TEXT, relief="flat",
+                                  insertbackground=TEXT, font=("Segoe UI", 10))
+        self.ent_proxy.pack(fill="x", pady=2)
+        self.ent_proxy.insert(0, "vd: http://user:pass@host:port")
+        self.ent_proxy.bind(
+            "<FocusIn>",
+            lambda _e: self._clear_placeholder(self.ent_proxy,
+                                               "vd: http://user:pass@host:port"))
+        prow = tk.Frame(acc_box, bg=PANEL)
+        prow.pack(fill="x", pady=2)
+        make_button(prow, "💾 Lưu proxy", "#3a3a4d",
+                    self._save_proxy).pack(side="left", fill="x", expand=True,
+                                           padx=(0, 4))
+        make_button(prow, "🌐 Kiểm tra", "#3a3a4d",
+                    self._test_proxy).pack(side="left", fill="x", expand=True)
+
+        set_box = section(inner, "THÔNG SỐ CHẠY")
         set_box.pack(fill="x", pady=(0, 8))
 
         drow = tk.Frame(set_box, bg=PANEL)
@@ -200,29 +363,32 @@ class MainWindow:
             ("Chạy ngầm (Giấu trình duyệt)", self.var_headless),
             ("Tự động Comment sau khi Đăng", self.var_auto_comment),
             ("Đăng bằng Fanpage (Tự chuyển Page)", self.var_fanpage),
+            ("Xoay vòng nhiều profile/Page", self.var_rotate_voice),
         ]:
             tk.Checkbutton(set_box, text=text, variable=var, bg=PANEL, fg=TEXT,
                            selectcolor=FIELD, activebackground=PANEL, anchor="w",
                            font=("Segoe UI", 9)).pack(fill="x", pady=2)
 
-        mrow = tk.Frame(set_box, bg=PANEL)
-        mrow.pack(fill="x", pady=(4, 0))
+        # ---- noi dung cum dieu khien duoi day (khung bottom da pack o tren)
+        mrow = tk.Frame(bottom, bg=PANEL)
+        mrow.pack(fill="x", pady=(0, 4))
         tk.Label(mrow, text="Chế độ:", bg=PANEL, fg=TEXT,
                  font=("Segoe UI", 9)).pack(side="left")
         self.cbo_mode = ttk.Combobox(mrow, state="readonly", width=20,
-                                     values=["🧪 Chạy thử (Mock)", "🌐 Thật (Requests)"])
+                                     values=["🧪 Chạy thử (Mock)", "🌐 Thật (Requests)",
+                                             "🌍 Thật (Trình duyệt)"])
         self.cbo_mode.pack(side="left", padx=4, fill="x", expand=True)
         self.cbo_mode.current(0)
 
-        make_button(self.left, "▶ BẮT ĐẦU ĐĂNG", ACCENT, self._on_start).pack(fill="x", pady=3)
-        make_button(self.left, "● AUTO COMMENT (UP BÀI)", "#1f6feb",
-                    self._on_auto_comment).pack(fill="x", pady=3)
-        make_button(self.left, "⏹ DỪNG LẠI", "#5a1f28", self._on_stop,
-                    fg="#ff8a8a").pack(fill="x", pady=3)
+        make_button(bottom, "▶ BẮT ĐẦU ĐĂNG", ACCENT, self._on_start).pack(fill="x", pady=2)
+        make_button(bottom, "● AUTO COMMENT (UP BÀI)", "#1f6feb",
+                    self._on_auto_comment).pack(fill="x", pady=2)
+        make_button(bottom, "⏹ DỪNG LẠI", "#5a1f28", self._on_stop,
+                    fg="#ff8a8a").pack(fill="x", pady=2)
 
-        foot = tk.Frame(self.left, bg=BG)
-        foot.pack(side="bottom", fill="x", pady=6)
-        tk.Label(foot, text="✨ Dev by Tú Anh", bg="#2b2b12", fg=ACCENT,
+        foot = tk.Frame(bottom, bg=BG)
+        foot.pack(fill="x", pady=(4, 0))
+        tk.Label(foot, text="✨ Dev by Giang Vũ", bg="#2b2b12", fg=ACCENT,
                  font=("Segoe UI", 9, "bold"), pady=4).pack(fill="x")
         tk.Label(foot, text=f"HWID: {get_hwid()}", bg=BG, fg=MUTED,
                  font=("Consolas", 8)).pack(anchor="w", pady=2)
@@ -393,6 +559,13 @@ class MainWindow:
         tk.Spinbox(srow, from_=0, to=3600, textvariable=self.var_c_delay_max, width=6,
                    bg=FIELD, fg=TEXT, relief="flat").pack(side="left", padx=4)
 
+        lrow = tk.Frame(parent, bg=BG)
+        lrow.pack(fill="x", pady=2)
+        tk.Checkbutton(lrow, text="👍 Tự động thả Like cho bài viết",
+                       variable=self.var_auto_like, bg=BG, fg=TEXT,
+                       selectcolor=FIELD, activebackground=BG, anchor="w",
+                       font=("Segoe UI", 9)).pack(anchor="w")
+
         brow = tk.Frame(parent, bg=BG)
         brow.pack(fill="x", pady=6)
         make_button(brow, "▶ BẮT ĐẦU AUTO COMMENT", "#1f6feb",
@@ -408,23 +581,39 @@ class MainWindow:
             posted = (p.get("posted_at", "")[:16] or "").replace("T", " ")
             self.lst_posts.insert(
                 "end",
-                f"{p.get('group_name') or p.get('group_id')} | {p['post_id']} | "
+                f"{p.get('group_name') or p.get('group_id')} | "
+                f"{_short_id(p['post_id'])} | "
                 f"{posted} | đã up: {p.get('up_count', 0)}")
         self.lbl_post_count.configure(text=f"Tổng số bài: {self.lst_posts.size()}")
 
     def _add_post_manual(self):
         raw = simpledialog.askstring(
-            "Thêm bài", "Nhập theo định dạng: post_id|group_id|tên nhóm",
+            "Thêm bài",
+            "Dán link bài viết Facebook (vd. facebook.com/.../posts/123...)\n"
+            "hoặc nhập theo dạng cũ: post_id|group_id|tên nhóm",
             parent=self.root)
-        if not raw:
+        if not raw or not raw.strip():
             return
-        parts = [x.strip() for x in raw.split("|")]
-        if not parts[0]:
-            return
-        self.posted_store.add(
-            group_id=parts[1] if len(parts) > 1 else "",
-            group_name=parts[2] if len(parts) > 2 else "",
-            post_id=parts[0])
+        raw = raw.strip()
+        if "|" in raw:
+            parts = [x.strip() for x in raw.split("|")]
+            if not parts[0]:
+                return
+            self.posted_store.add(
+                group_id=parts[1] if len(parts) > 1 else "",
+                group_name=parts[2] if len(parts) > 2 else "",
+                post_id=parts[0])
+        else:
+            post_id, label = _extract_post_id_from_url(raw)
+            if not post_id:
+                messagebox.showwarning(
+                    "Thêm bài",
+                    "Không tách được ID bài viết từ link.\n"
+                    "Nếu là link share rút gọn, hãy mở nó trên trình duyệt,\n"
+                    "rồi copy link trên thanh địa chỉ dán vào đây.")
+                return
+            self.posted_store.add(group_id="", group_name=label or "Bài viết",
+                                  post_id=post_id)
         self._load_posted()
 
     def _delete_post_selected(self):
@@ -453,6 +642,7 @@ class MainWindow:
         self.posted_store.increment_up(post_id)
         self.root.after(0, self._load_posted)
 
+    @_guard
     def _on_start_comment(self):
         posts = self.posted_store.list()
         if not posts:
@@ -462,8 +652,10 @@ class MainWindow:
                 "hoặc thêm bài thủ công.")
             return
         comment = self.txt_up_comment.get("1.0", "end-1c")
-        if not comment.strip():
-            messagebox.showwarning("Auto Comment", "Nội dung comment đang trống.")
+        if not comment.strip() and not self.var_auto_like.get():
+            messagebox.showwarning(
+                "Auto Comment",
+                "Nội dung comment đang trống (hoặc tick 'Tự động thả Like').")
             return
         client, mode_label = self._build_client()
         if client is None:
@@ -474,16 +666,31 @@ class MainWindow:
             rounds=self.var_c_rounds.get(),
             delay_min=self.var_c_delay_min.get(),
             delay_max=self.var_c_delay_max.get(),
+            use_fanpage=self.var_fanpage.get() or self.var_rotate_voice.get(),
+            rotate_voice=self.var_rotate_voice.get(),
+            auto_like=self.var_auto_like.get(),
         )
         started = self.comment_scheduler.start(
             job, client,
-            on_done=lambda: self.root.after(0, self._on_comment_done),
+            on_done=lambda: self._finish_client(client, self._on_comment_done),
             on_commented=self._on_post_upped)
         if started:
             self.log.info(f"Auto comment bắt đầu (chế độ {mode_label}).")
 
+    @_guard
     def _on_stop_comment(self):
         self.comment_scheduler.stop()
+
+    def _finish_client(self, client, ui_done):
+        """Đóng client sau khi job xong (chạy trong worker thread — đúng thread
+        đã mở browser của Playwright), rồi mới báo UI."""
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001
+                pass
+        self.root.after(0, ui_done)
 
     def _on_comment_done(self):
         messagebox.showinfo("Hoàn tất",
@@ -495,7 +702,7 @@ class MainWindow:
         head.pack(fill="x", pady=(0, 4))
         tk.Label(head, text="⚡ TERMINAL / LOG HOẠT ĐỘNG", bg=BG, fg=TEXT,
                  font=("Segoe UI", 10, "bold")).pack(side="left")
-        make_button(head, "✨ Dev by Tú Anh", "#3a2b12", self._dev_info,
+        make_button(head, "✨ Dev by Giang Vũ", "#3a2b12", self._dev_info,
                     fg=ACCENT).pack(side="right", padx=2)
         make_button(head, "🧹 Dọn Log", "#2b2b3d", self._clear_log,
                     fg=MUTED).pack(side="right", padx=2)
@@ -689,6 +896,9 @@ class MainWindow:
         acc = self.accounts.get(username) or {}
         self.lbl_user.configure(text=f"User: {username or '-'}")
         self.lbl_hsd.configure(text=f"HSD: {acc.get('expiry', '-')}")
+        self.ent_proxy.delete(0, "end")
+        self.ent_proxy.insert(
+            0, self.accounts.get_proxy(username) or "vd: http://user:pass@host:port")
 
     def _add_profile(self):
         username = simpledialog.askstring("Thêm profile", "Tên tài khoản:",
@@ -804,16 +1014,181 @@ class MainWindow:
         make_button(btnrow, "Hủy", "#33333f", win.destroy, fg=MUTED).pack(
             side="left")
 
+    # ---------- proxy theo tài khoản ----------
+    @staticmethod
+    def _mask_proxy(url):
+        """Ẩn user:pass khi hiển thị/log: 'http://user:pass@h:p' -> 'h:p'."""
+        return url.split("://", 1)[-1].rsplit("@", 1)[-1]
+
+    def _save_proxy(self):
+        username = self.cbo_profile.get()
+        raw = self.ent_proxy.get().strip()
+        if raw.startswith("vd:"):
+            raw = ""
+        if raw:
+            try:
+                parse_proxy(raw)
+            except ValueError as exc:
+                messagebox.showerror("Proxy không hợp lệ", str(exc))
+                return
+        self.accounts.set_proxy(username, raw)
+        self.log.success(f"Đã lưu proxy cho '{username}'.")
+
+    def _test_proxy(self):
+        if not _HAS_FB_REQUESTS:
+            messagebox.showerror("Thiếu thư viện",
+                                 "Cần cài 'requests' trước:\n\npip install requests")
+            return
+        raw = self.ent_proxy.get().strip()
+        if not raw or raw.startswith("vd:"):
+            messagebox.showwarning("Kiểm tra proxy", "Hãy nhập proxy trước.")
+            return
+        try:
+            client = RequestsFacebookClient(
+                self.accounts.get(self.cbo_profile.get()))
+            url = client.set_proxy(raw)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Proxy không hợp lệ", str(exc))
+            return
+        self.log.info(f"Đang kiểm tra proxy {self._mask_proxy(url)}...")
+        threading.Thread(target=self._do_test_proxy,
+                         args=(client, url), daemon=True).start()
+
+    def _do_test_proxy(self, client, url):
+        res = client.test_proxy()
+        self.root.after(0, self._on_test_proxy_done, res, url)
+
+    def _on_test_proxy_done(self, res, url):
+        mask = self._mask_proxy(url)
+        if res.get("ok"):
+            msg = (f"Proxy {mask} hoạt động! "
+                   f"IP hiện tại: {res['ip']} (ping {res['latency_ms']}ms)")
+            self.log.success(msg)
+            messagebox.showinfo("Kiểm tra proxy", msg)
+        else:
+            msg = f"Proxy {mask} lỗi: {res.get('error')}"
+            self.log.error(msg)
+            messagebox.showerror("Kiểm tra proxy", msg)
+
+    # ---------- tự động cập nhật ----------
+    def _check_update(self):
+        self.btn_update.config(state="disabled")
+        self.log.info("Đang kiểm tra cập nhật từ GitHub...")
+        threading.Thread(target=self._do_check_update, daemon=True).start()
+
+    def _do_check_update(self):
+        try:
+            info = check_update()
+        except Exception as exc:  # noqa: BLE001 - báo lỗi ra log/dialog
+            self.root.after(0, self._on_update_error, str(exc))
+            return
+        self.root.after(0, self._on_update_checked, info)
+
+    def _on_update_error(self, msg):
+        self.btn_update.config(state="normal")
+        self.log.error(msg)
+        messagebox.showerror("Kiểm tra cập nhật", msg)
+
+    def _on_update_checked(self, info):
+        self.btn_update.config(state="normal")
+        if info is None:
+            msg = f"Bạn đang dùng bản mới nhất (v{get_local_version()})."
+            self.log.success(msg)
+            messagebox.showinfo("Kiểm tra cập nhật", msg)
+            return
+        self.log.info(
+            f"Có bản mới v{info['version']} (bạn đang dùng v{info['local']}).")
+        text = (f"Có bản cập nhật v{info['version']} "
+                f"(hiện tại v{info['local']}).")
+        if info.get("notes", "").strip():
+            text += f"\n\nGhi chú:\n{info['notes'].strip()}"
+        text += "\n\nTải và cập nhật ngay?"
+        if messagebox.askyesno("Có bản cập nhật", text):
+            self._apply_update(info)
+
+    def _apply_update(self, info):
+        self.btn_update.config(state="disabled")
+        self.log.info(f"Đang tải bản v{info['version']}...")
+        threading.Thread(target=self._do_apply_update,
+                         args=(info,), daemon=True).start()
+
+    def _do_apply_update(self, info):
+        try:
+            new_ver = apply_update(info)
+        except Exception as exc:  # noqa: BLE001
+            self.root.after(0, self._on_update_error,
+                            f"Cập nhật thất bại: {exc}")
+            return
+        self.root.after(0, self._on_update_done, new_ver)
+
+    def _on_update_done(self, new_ver):
+        self.btn_update.config(state="normal")
+        self.log.success(f"Đã cập nhật lên v{new_ver}.")
+        if is_frozen():
+            messagebox.showinfo(
+                "Cập nhật xong",
+                f"Đã cập nhật code lên v{new_ver}.\n\n"
+                "Bạn đang chạy file .exe — hãy chạy lại build_windows.bat "
+                "để build bản exe mới rồi dùng.")
+        elif messagebox.askyesno(
+                "Cập nhật xong",
+                f"Đã cập nhật lên v{new_ver}.\n\n"
+                "Khởi động lại app ngay để dùng bản mới?"):
+            self.log.info("Khởi động lại app...")
+            self.root.update()
+            restart_app()
+
     def _build_client(self):
         """Trả về (client, mô tả chế độ) hoặc (None, None) nếu chưa đủ điều kiện."""
         username = self.cbo_profile.get()
         account = self.accounts.get(username)
+        if self.cbo_mode.get().startswith("🌍"):
+            if not _HAS_PLAYWRIGHT:
+                messagebox.showerror(
+                    "Thiếu thư viện",
+                    "Chế độ trình duyệt cần cài thêm:\n\n"
+                    "pip install playwright\n"
+                    "playwright install chromium")
+                return None, None
+            proxy = self.accounts.get_proxy(username)
+            if proxy:
+                try:
+                    parse_proxy(proxy)
+                except ValueError as exc:
+                    messagebox.showerror(
+                        "Proxy lỗi",
+                        f"Proxy của '{username}' không hợp lệ:\n{exc}")
+                    return None, None
+                self.log.info(
+                    f"Đã dùng proxy riêng cho tài khoản '{username}'.")
+            client = PlaywrightFacebookClient(
+                account, proxy=proxy, headless=self.var_headless.get())
+            try:
+                client.ensure_login()
+            except FacebookError as exc:
+                self.log.error(str(exc))
+                messagebox.showwarning(
+                    "Chưa đăng nhập FB",
+                    f"{exc}\n\nBấm '🍪 Nhập cookies từ trình duyệt' ở panel trái.")
+                return None, None
+            return client, "thật (Trình duyệt)"
         if self.cbo_mode.get().startswith("🌐"):
             if not _HAS_FB_REQUESTS:
                 messagebox.showerror("Thiếu thư viện",
                                      "Cần cài 'requests' trước:\n\npip install requests")
                 return None, None
             client = RequestsFacebookClient(account)
+            proxy = self.accounts.get_proxy(username)
+            if proxy:
+                try:
+                    client.set_proxy(proxy)
+                except Exception as exc:  # noqa: BLE001
+                    messagebox.showerror(
+                        "Proxy lỗi",
+                        f"Proxy của '{username}' không hợp lệ:\n{exc}")
+                    return None, None
+                self.log.info(
+                    f"Đã dùng proxy riêng cho tài khoản '{username}'.")
             try:
                 client.ensure_login()
             except FacebookError as exc:
@@ -827,6 +1202,7 @@ class MainWindow:
         return MockFacebookClient(account), "chạy thử (Mock)"
 
     # ================= chạy chiến dịch =================
+    @_guard
     def _on_start(self):
         groups = self.group_lists.get(self._current_list_name(), [])
         if not groups:
@@ -847,12 +1223,13 @@ class MainWindow:
             delay_max=self.var_delay_max.get(),
             auto_comment=self.var_auto_comment.get(),
             comment_text=self.txt_comment.get("1.0", "end-1c"),
-            use_fanpage=self.var_fanpage.get(),
+            use_fanpage=self.var_fanpage.get() or self.var_rotate_voice.get(),
+            rotate_voice=self.var_rotate_voice.get(),
             headless=self.var_headless.get(),
         )
         started = self.scheduler.start(
             job, client,
-            on_done=lambda: self.root.after(0, self._on_campaign_done),
+            on_done=lambda: self._finish_client(client, self._on_campaign_done),
             on_posted=self._record_posted)
         if started:
             self.log.info(f"Chiến dịch bắt đầu (chế độ {mode_label}).")
@@ -860,9 +1237,11 @@ class MainWindow:
     def _on_campaign_done(self):
         messagebox.showinfo("Hoàn tất", "Chiến dịch đã kết thúc. Xem log để biết chi tiết.")
 
+    @_guard
     def _on_stop(self):
         self.scheduler.stop()
 
+    @_guard
     def _on_auto_comment(self):
         self._show_tab("comment")
         self._load_posted()
@@ -878,4 +1257,4 @@ class MainWindow:
             "4. Nhấn BẮT ĐẦU ĐĂNG.")
 
     def _dev_info(self):
-        messagebox.showinfo("Dev", "PRO AUTO POSTER 2.0\nDev by Tú Anh")
+        messagebox.showinfo("Dev", "PRO AUTO POSTER 2.0\nDev by Giang Vũ")

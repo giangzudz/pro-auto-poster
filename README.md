@@ -31,7 +31,16 @@ ui/
   main_window.py        Giao diện chính
 ```
 
-## Đăng bài thật (Requests)
+## Đăng bài thật
+
+App có 3 chế độ chạy (chọn ở ô "Chế độ"):
+- **🧪 Chạy thử (Mock)**: giả lập, không chạm vào Facebook — dùng để test giao diện.
+- **🌐 Thật (Requests)**: dùng HTTP trực tiếp (nhẹ). Lưu ý: từ 2026 Facebook chặn
+  mạnh client HTTP ở mbasic/m.facebook.com ("Trình duyệt này không hỗ trợ").
+- **🌍 Thật (Trình duyệt)**: điều khiển trình duyệt Chromium **thật** bằng Playwright
+  trên www.facebook.com — qua được mọi lớp kiểm tra client. Cần cài:
+  `pip install playwright` + `playwright install chromium`.
+  Cookies dùng chung với chế độ Requests (nhập 1 lần bằng nút 🍪).
 
 1. `pip install -r requirements.txt`
 2. Ở panel trái, nhập Email/Mật khẩu Facebook → bấm "🔐 Đăng nhập & lưu cookies".
@@ -45,6 +54,9 @@ Lưu ý:
 - **Đăng nhập bằng cookies (khuyên dùng):** trên trình duyệt đã đăng nhập Facebook,
   dùng tiện ích Cookie-Editor → Export (Header String / JSON) hoặc Get cookies.txt,
   rồi bấm "🍪 Nhập cookies từ trình duyệt" trong app và dán vào. Không cần nhập mật khẩu.
+- App dùng `curl_cffi` để giả lập Chrome thật ở mức TLS/HTTP2 (cài bằng
+  `pip install curl_cffi`). Nếu thiếu, app vẫn chạy bằng `requests` nhưng Facebook
+  có thể chặn và báo "Trình duyệt này không hỗ trợ".
 - Đăng kèm ảnh/video qua requests chưa hỗ trợ (app sẽ báo lỗi rõ ràng).
 - Form/selector của Facebook có thể đổi theo thời gian; các điểm mong manh được gom
   trong `core/fb_requests_client.py` (các hàm `_find_*`) để dễ chỉnh.
@@ -101,11 +113,24 @@ Lưu ý:
 - [x] Hỗ trợ proxy v4/v6 cho RequestsFacebookClient (parse nhiều định dạng, set_proxy, test_proxy)
 - [ ] Đăng kèm ảnh/video qua requests
 - [x] Đăng nhập bằng cookies (paste chuỗi cookies nhiều định dạng: Netscape/JSON/Header)
-- [ ] UI nhập proxy cố định theo tài khoản (desktop)
+- [x] UI nhập proxy cố định theo tài khoản (desktop): ô nhập + Lưu/Kiểm tra, tự dùng khi chạy
 - [ ] API check nội dung comment, check link, get info nâng cao
 - [ ] Tích hợp Golike (giữ nguyên interface `FacebookClient`, UI/Scheduler không phải sửa)
 - [x] Hoàn thiện tab Auto Comment (quét bài đã đăng → comment up bài theo vòng)
+- [x] Tự động kiểm tra cập nhật từ GitHub (nút "🔄 Kiểm tra cập nhật" trong app)
 - [ ] Đóng gói .exe bằng PyInstaller
+
+## Tự động cập nhật
+
+App có nút **"🔄 Kiểm tra cập nhật"** (panel trái): so `version.json` local với bản
+trên GitHub, nếu có bản mới sẽ tải `main.zip` về và chép đè code (bỏ qua
+`.git/__pycache__/build/dist`). Dữ liệu tài khoản/cookies nằm ở
+`~/.proautoposter` nên không bị ảnh hưởng.
+- Chạy từ source (`python main.py`): app tự khởi động lại để dùng bản mới.
+- Chạy file `.exe`: sau khi cập nhật, chạy lại `build_windows.bat` để build exe mới.
+
+Quy trình ra bản mới: sửa code → tăng `"version"` trong `version.json`
+(ghi chú thay đổi vào `"notes"`) → commit + push lên GitHub.
 
 ## Lưu ý
 

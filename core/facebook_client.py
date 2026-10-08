@@ -23,13 +23,18 @@ class FacebookClient:
         """Đăng nhập / nạp session. Trả về True nếu thành công."""
         raise NotImplementedError("Chưa cài đặt login() - hãy override ở lớp con.")
 
-    def post_to_group(self, group_id, message, media_path=None):
+    def post_to_group(self, group_id, message, media_path=None,
+                      use_fanpage=False, rotate_voice=False):
         """Đăng bài lên nhóm. Trả về dict, tối thiểu {'post_id': ...}."""
         raise NotImplementedError("Chưa cài đặt post_to_group().")
 
-    def comment(self, post_id, message):
+    def comment(self, post_id, message, use_fanpage=False, rotate_voice=False):
         """Bình luận vào bài viết. Trả về dict, tối thiểu {'comment_id': ...}."""
         raise NotImplementedError("Chưa cài đặt comment().")
+
+    def like(self, post_id, use_fanpage=False, rotate_voice=False):
+        """Thả like cho bài viết. Trả về dict, tối thiểu {'liked': True}."""
+        raise NotImplementedError("Chưa cài đặt like().")
 
     # ---------------- mở rộng (theo danh sách tính năng) ----------------
     def get_group_info(self, group_id):
@@ -51,13 +56,18 @@ class MockFacebookClient(FacebookClient):
     def login(self):
         return True
 
-    def post_to_group(self, group_id, message, media_path=None):
+    def post_to_group(self, group_id, message, media_path=None,
+                      use_fanpage=False, rotate_voice=False):
         time.sleep(0.5)
         return {"post_id": f"mock_{group_id}_{int(time.time())}"}
 
-    def comment(self, post_id, message):
+    def comment(self, post_id, message, use_fanpage=False, rotate_voice=False):
         time.sleep(0.3)
         return {"comment_id": f"mock_c_{int(time.time())}"}
+
+    def like(self, post_id, use_fanpage=False, rotate_voice=False):
+        time.sleep(0.3)
+        return {"liked": True, "as_page": "", "already": False}
 
     def get_group_info(self, group_id):
         return {"id": group_id, "name": f"Nhóm {group_id}", "members": 0}

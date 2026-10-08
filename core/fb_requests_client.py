@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 RequestsFacebookClient: đăng bài / bình luận Facebook thật bằng `requests`
-qua giao diện mbasic (nhẹ, không cần trình duyệt).
+qua giao diện m.facebook.com (nhẹ, không cần trình duyệt).
 
 Luồng sử dụng:
   1. login(email, password)  -> lấy cookies, lưu vào ~/.proautoposter/
@@ -32,11 +32,38 @@ try:
 except ImportError:  # pragma: no cover
     requests = None
 
+try:
+    from curl_cffi import requests as _crequests
+    _HAS_CURL_CFFI = True
+except ImportError:
+    _crequests = None
+    _HAS_CURL_CFFI = False
 
-MBASIC = "https://mbasic.facebook.com"
+# Động cơ HTTP đang dùng: "curl_cffi" giả lập TLS/HTTP2 của Chrome thật
+# (để qua lớp kiểm tra client của Facebook), "requests" là fallback.
+HTTP_ENGINE = "curl_cffi" if _HAS_CURL_CFFI else "requests"
+
+
+def _make_session():
+    """Tạo session HTTP. Ưu tiên curl_cffi giả lập Chrome thật;
+    tự thử target khác nếu version curl_cffi không hỗ trợ."""
+    if _HAS_CURL_CFFI:
+        for target in ("chrome120", "chrome"):
+            try:
+                return _crequests.Session(impersonate=target)
+            except Exception:  # noqa: BLE001 - thử target khác
+                continue
+        try:
+            return _crequests.Session()
+        except Exception:  # noqa: BLE001 - rớt xuống requests
+            pass
+    return requests.Session()
+
+
+MFB = "https://m.facebook.com"
 MOBILE_UA = (
     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
 )
 
 _PROFILE_BLACKLIST = {
@@ -113,15 +140,47 @@ def _parse_forms(page_html):
     return parser.forms
 
 
+class _LinkParser(HTMLParser):
+    """Trích mọi <a>: (href, text)."""
+
+    def __init__(self):
+        super().__init__()
+        self.links = []
+        self._cur = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self._cur = [dict(attrs).get("href", ""), ""]
+
+    def handle_data(self, data):
+        if self._cur is not None:
+            self._cur[1] += data
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._cur is not None:
+            self.links.append(tuple(self._cur))
+            self._cur = None
+
+
+def _parse_links(page_html):
+    parser = _LinkParser()
+    parser.feed(page_html)
+    return parser.links
+
+
 # ---------------- client ----------------
 class RequestsFacebookClient(FacebookClient):
     def __init__(self, account, proxy=None):
         super().__init__(account)
         _require_requests()
-        self.session = requests.Session()
+        self.session = _make_session()
+        self.http_engine = HTTP_ENGINE
         self.session.headers.update({
             "User-Agent": MOBILE_UA,
+            "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                       "image/avif,image/webp,*/*;q=0.8"),
             "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
+            "Upgrade-Insecure-Requests": "1",
         })
         username = (account or {}).get("username", "default")
         safe = re.sub(r"[^a-zA-Z0-9_-]", "_", str(username))
@@ -159,7 +218,7 @@ class RequestsFacebookClient(FacebookClient):
 
     # ---------- tiện ích ----------
     @staticmethod
-    def _abs(action, base=MBASIC):
+    def _abs(action, base=MFB):
         return urllib.parse.urljoin(base.rstrip("/") + "/", action)
 
     def _get(self, url, **kw):
@@ -181,6 +240,8 @@ class RequestsFacebookClient(FacebookClient):
     def _find_login_form(forms):
         for form in forms:
             names = " ".join(form["inputs"].keys()).lower()
+            if "login" in form.get("action", "").lower():
+                return form
             if "pass" in names and "email" in names:
                 return form
         return None
@@ -207,6 +268,61 @@ class RequestsFacebookClient(FacebookClient):
                 return form
         return None
 
+    def _page_hint(self, resp):
+        """Đoán nguyên nhân khi trang không chứa form mong đợi."""
+        url = getattr(resp, "url", "") or ""
+        html_text = getattr(resp, "text", "") or ""
+        if "checkpoint" in url:
+            return " Tài khoản đang bị checkpoint — hãy xác minh trên trình duyệt thật."
+        low = html_text.lower()
+        if ("unsupported-interstitial" in low
+                or "trình duyệt này không hỗ trợ" in low):
+            hint = (" Facebook từ chối kết nối từ app (báo 'Trình duyệt này "
+                    "không hỗ trợ').")
+            if getattr(self, "http_engine", "") == "requests":
+                hint += (" App đang chạy bằng 'requests' (chưa cài curl_cffi) — "
+                         "hãy cài: pip install curl_cffi, rồi thử lại.")
+            else:
+                hint += (" Thử lần lượt: 1) nhập cookies MỚI từ trình duyệt đang "
+                         "đăng nhập (nút 🍪), 2) nếu vẫn lỗi, Facebook có thể đang "
+                         "chặn IP này — thử proxy khác hoặc mạng khác "
+                         "(vd: phát 4G từ điện thoại).")
+            return hint
+        if self._find_login_form(_parse_forms(html_text)) is not None:
+            return (" Phiên đăng nhập đã hết hạn (cookies không còn hiệu lực) — "
+                    "hãy nhập cookies mới bằng nút '🍪 Nhập cookies từ trình duyệt'.")
+        if ("logout.php" not in low and "đăng xuất" not in low
+                and ("đăng nhập" in low or "/login.php" in low)):
+            return (" Trang trả về ở trạng thái chưa đăng nhập — "
+                    "cookies có thể đã hết hạn, hãy nhập cookies mới.")
+        if "tham gia nhóm" in low or "join group" in low:
+            return (" Tài khoản chưa tham gia nhóm này (hoặc chưa được duyệt) — "
+                    "hãy join nhóm bằng trình duyệt trước khi đăng.")
+        if ("không tìm thấy" in low or "không tồn tại" in low
+                or "content not found" in low or "page not found" in low
+                or "nội dung này hiện không hiển thị" in low):
+            return (" ID không đúng hoặc tài khoản không có quyền xem/đăng. "
+                    "Kiểm tra lại: ID nhóm lấy từ URL facebook.com/groups/<số>/ .")
+        return ""
+
+    def _find_composer_link(self, html_text):
+        """Tìm link sang trang composer riêng (Facebook hay dùng link
+        'Bạn đang nghĩ gì?' thay vì form soạn bài inline)."""
+        for href, _text in _parse_links(html_text):
+            if href and "composer" in href.lower():
+                return self._abs(href)
+        return None
+
+    def _dump_debug(self, filename, resp):
+        """Lưu HTML trang về ~/.proautoposter/ để debug. Không bao giờ ném lỗi."""
+        try:
+            path = os.path.join(BASE_DIR, filename)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(getattr(resp, "text", "") or "")
+            return path
+        except OSError:
+            return ""
+
     @staticmethod
     def _looks_like_success(page_html, message):
         snippet = message.strip()[:40]
@@ -227,7 +343,7 @@ class RequestsFacebookClient(FacebookClient):
     # ---------- cookies ----------
     def save_cookies(self):
         os.makedirs(BASE_DIR, exist_ok=True)
-        data = requests.utils.dict_from_cookiejar(self.session.cookies)
+        data = self.session.cookies.get_dict()
         with open(self.cookies_path, "w", encoding="utf-8") as f:
             json.dump(data, f)
 
@@ -237,7 +353,10 @@ class RequestsFacebookClient(FacebookClient):
                 data = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             return False
-        self.session.cookies.update(requests.utils.cookiejar_from_dict(data))
+        jar = self.session.cookies
+        jar.clear()
+        for name, value in data.items():
+            jar.set(name, str(value), domain=".facebook.com", path="/")
         return self._is_logged_in()
 
     def ensure_login(self):
@@ -252,16 +371,11 @@ class RequestsFacebookClient(FacebookClient):
         Không cần email/mật khẩu. Ném FacebookError nếu cookies không hợp lệ."""
         parsed = parse_cookie_string(cookie_string)
         jar = self.session.cookies
-        # Xóa cookies facebook cũ để tránh lẫn với bộ mới
-        for cookie in list(jar):
-            if "facebook" in (cookie.domain or ""):
-                jar.clear(domain=cookie.domain, path=cookie.path, name=cookie.name)
+        jar.clear()  # xóa bộ cookies cũ để tránh lẫn với bộ mới
         for c in parsed:
-            jar.set_cookie(requests.cookies.create_cookie(
-                c["name"], c["value"],
-                domain=c.get("domain") or ".facebook.com",
-                path=c.get("path") or "/",
-            ))
+            jar.set(c["name"], c["value"],
+                    domain=c.get("domain") or ".facebook.com",
+                    path=c.get("path") or "/")
         if not self._is_logged_in():
             raise FacebookError(
                 "Cookies không hợp lệ: thiếu cookie c_user "
@@ -275,7 +389,7 @@ class RequestsFacebookClient(FacebookClient):
         if not email or not password:
             raise LoginFailed("Thiếu email hoặc mật khẩu.")
         try:
-            home = self._get(MBASIC)
+            home = self._get(MFB)
         except Exception as exc:  # noqa: BLE001
             raise FacebookError(
                 "Không tải được trang đăng nhập Facebook. Nguyên nhân thường gặp: "
@@ -308,33 +422,61 @@ class RequestsFacebookClient(FacebookClient):
             return True
         raise LoginFailed("Đăng nhập thất bại (sai email/mật khẩu hoặc tài khoản bị hạn chế).")
 
-    def post_to_group(self, group_id, message, media_path=None):
+    def post_to_group(self, group_id, message, media_path=None,
+                      use_fanpage=False, rotate_voice=False):
+        # NOTE: chế độ requests chưa hỗ trợ đăng bằng Fanpage (chỉ có ở chế độ
+        # trình duyệt) — tham số được chấp nhận để tương thích interface.
         self.ensure_login()
         if media_path:
             raise PostFailed("Đăng kèm ảnh/video qua requests chưa hỗ trợ - "
                              "hãy đăng bài text trước.")
-        page = self._get(f"{MBASIC}/groups/{group_id}")
+        page = self._get(f"{MFB}/groups/{group_id}")
         form = self._find_composer_form(_parse_forms(page.text))
         if form is None or not form["textareas"]:
-            raise PostFailed(f"Không tìm thấy khung soạn bài trong nhóm {group_id}.")
+            # Facebook có thể đặt ô soạn bài dưới dạng link sang trang composer riêng
+            composer_url = self._find_composer_link(page.text)
+            if composer_url:
+                page = self._get(composer_url)
+                form = self._find_composer_form(_parse_forms(page.text))
+        if form is None or not form["textareas"]:
+            dbg = self._dump_debug(f"debug_group_{group_id}.html", page)
+            hint = self._page_hint(page)
+            if dbg:
+                hint += f" (đã lưu HTML trang tại {dbg} — gửi file này để mình kiểm tra)"
+            raise PostFailed(
+                f"Không tìm thấy khung soạn bài trong nhóm {group_id}." + hint)
         payload = dict(form["inputs"])
         payload[form["textareas"][0]] = message
-        resp = self.session.post(self._abs(form["action"], f"{MBASIC}/groups/{group_id}"),
+        resp = self.session.post(self._abs(form["action"], f"{MFB}/groups/{group_id}"),
                                  data=payload, timeout=30)
         resp.raise_for_status()
         if self._looks_like_success(resp.text, message):
             post_id = (self._extract_post_id(resp.text)
-                       or f"mbasic_{group_id}_{int(time.time())}")
+                       or f"mfb_{group_id}_{int(time.time())}")
             return {"post_id": post_id}
         raise PostFailed("Facebook không trả về dấu hiệu đăng thành công.")
 
-    def comment(self, post_id, message):
+    def like(self, post_id, use_fanpage=False, rotate_voice=False):
+        raise FacebookError(
+            "Chế độ requests chưa hỗ trợ like - "
+            "hãy dùng chế độ Thật (Trình duyệt).")
+
+    def comment(self, post_id, message, use_fanpage=False, rotate_voice=False):
+        # NOTE: chế độ requests chưa hỗ trợ bình luận bằng Fanpage.
+        if str(post_id).strip().startswith("http"):
+            raise FacebookError(
+                "Chế độ requests không mở được link đầy đủ - "
+                "hãy dùng chế độ Thật (Trình duyệt).")
         self.ensure_login()
         fbid = str(post_id).split("_")[-1]
-        page = self._get(f"{MBASIC}/story.php?story_fbid={fbid}")
+        page = self._get(f"{MFB}/story.php?story_fbid={fbid}")
         form = self._find_comment_form(_parse_forms(page.text))
         if form is None or not form["textareas"]:
-            raise PostFailed("Không tìm thấy khung bình luận.")
+            dbg = self._dump_debug(f"debug_post_{fbid}.html", page)
+            hint = self._page_hint(page)
+            if dbg:
+                hint += f" (đã lưu HTML trang tại {dbg} — gửi file này để mình kiểm tra)"
+            raise PostFailed("Không tìm thấy khung bình luận." + hint)
         payload = dict(form["inputs"])
         payload[form["textareas"][0]] = message
         resp = self.session.post(self._abs(form["action"]), data=payload, timeout=30)
@@ -344,7 +486,7 @@ class RequestsFacebookClient(FacebookClient):
 
     def get_group_info(self, group_id):
         self.ensure_login()
-        page = self._get(f"{MBASIC}/groups/{group_id}")
+        page = self._get(f"{MFB}/groups/{group_id}")
         m = re.search(r"<title>(.*?)</title>", page.text, re.S)
         name = html.unescape(m.group(1)).strip() if m else str(group_id)
         name = re.sub(r"\s*[|\-–]\s*Facebook.*$", "", name).strip() or str(group_id)
@@ -354,7 +496,7 @@ class RequestsFacebookClient(FacebookClient):
         """Quét UID/username thành viên nhóm (tối đa 20 trang, nghỉ 2s/trang)."""
         self.ensure_login()
         found, seen = [], set()
-        url = f"{MBASIC}/browse/group/members/?id={group_id}"
+        url = f"{MFB}/browse/group/members/?id={group_id}"
         pages = 0
         while url and len(found) < limit and pages < 20:
             pages += 1
@@ -400,7 +542,7 @@ class RequestsFacebookClient(FacebookClient):
             self.ensure_login()
         except LoginRequired:
             return {"status": "no_session"}
-        resp = self._get(MBASIC)
+        resp = self._get(MFB)
         if "checkpoint" in resp.url:
             return {"status": "checkpoint"}
         return {"status": "live" if self._is_logged_in() else "die"}

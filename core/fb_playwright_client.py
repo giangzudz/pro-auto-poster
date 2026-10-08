@@ -68,6 +68,8 @@ class PlaywrightFacebookClient(FacebookClient):
         safe = re.sub(r"[^a-zA-Z0-9_-]", "_", str(username))
         self.cookies_path = os.path.join(BASE_DIR, f"cookies_{safe}.json")
         self._cookies = self._load_cookies_dict()
+        self._voice_names = None  # lazy: danh sach ten voice de xoay vong
+        self._voice_idx = 0
 
     # ---------- cookies (dùng chung file với RequestsFacebookClient) ----------
     def _load_cookies_dict(self):
@@ -212,7 +214,8 @@ class PlaywrightFacebookClient(FacebookClient):
             "Chế độ trình duyệt không đăng nhập bằng mật khẩu. "
             "Hãy dùng nút '🍪 Nhập cookies từ trình duyệt' để nhập cookies trước.")
 
-    def post_to_group(self, group_id, message, media_path=None):
+    def post_to_group(self, group_id, message, media_path=None,
+                          use_fanpage=False, rotate_voice=False):
         if media_path:
             raise PostFailed("Chế độ trình duyệt hiện chỉ hỗ trợ đăng bài text.")
         self.ensure_login()
@@ -221,11 +224,12 @@ class PlaywrightFacebookClient(FacebookClient):
         page.goto(f"https://www.facebook.com/groups/{group_id}",
                   wait_until="domcontentloaded", timeout=60000)
 
-        # 1. Bấm vào ô "Bạn đang nghĩ gì?" để mở dialog soạn bài
+        # 1. Bấm vào ô soạn bài để mở dialog ("Bạn viết gì đi..." / "Bạn đang nghĩ gì?")
         trigger = None
         try:
-            t = page.get_by_text(re.compile("Bạn đang nghĩ gì|Write something",
-                                            re.I)).first
+            t = page.get_by_text(re.compile(
+                "Bạn viết gì đi|Bạn đang nghĩ gì|Write something|What's on your mind",
+                re.I)).first
             t.wait_for(state="visible", timeout=10000)
             trigger = t
         except Exception:  # noqa: BLE001
@@ -236,24 +240,98 @@ class PlaywrightFacebookClient(FacebookClient):
                 "(chưa join nhóm / không có quyền đăng / giao diện đã đổi?).")
         trigger.click()
 
-        # 2. Điền nội dung
-        box = self._first_visible(
-            page, "textbox",
-            ["Tạo bài viết công khai", "Tạo bài viết", "Bạn đang nghĩ gì"])
-        if box is None:
-            # fallback: textbox contenteditable đang mở
+        # 2. Chờ hộp thoại mở ra, rồi chọn ĐÚNG dialog soạn bài dựa vào nội dung
+        #    (không dùng .last/.first vì FB có nhiều dialog rỗng/lạ trong DOM —
+        #    debug cho thấy .last từng vớ nhầm dialog chỉ có tiêu đề, không có
+        #    khung soạn thảo). Dialog đúng = đang hiển thị + chứa khung soạn thảo
+        #    mà KHÔNG phải khung bình luận ("Bình luận dưới tên ...").
+        try:
+            page.get_by_role("dialog").first.wait_for(
+                state="visible", timeout=12000)
+        except Exception:  # noqa: BLE001
+            raise PostFailed(
+                "Đã bấm ô soạn bài nhưng hộp thoại 'Tạo bài viết' không mở.")
+        page.wait_for_timeout(1500)  # chờ nội dung dialog render xong
+
+        def _is_comment_box(el):
             try:
-                box = page.locator(
-                    "div[role='textbox'][contenteditable='true']").first
-                box.wait_for(state="visible", timeout=8000)
+                label = ((el.get_attribute("aria-label") or "") + " "
+                         + (el.get_attribute("aria-placeholder") or "")).lower()
+                return ("bình luận" in label or "binh luan" in label
+                        or "comment" in label)
             except Exception:  # noqa: BLE001
-                raise PostFailed("Không tìm thấy khung nhập nội dung bài viết.")
+                return False
+
+        def _find_editor(scope):
+            for sel in ["div[role='textbox'][contenteditable='true']",
+                        "[contenteditable='true']",
+                        "[data-lexical-editor='true']"]:
+                try:
+                    for el in scope.locator(sel).all():
+                        try:
+                            if el.is_visible() and not _is_comment_box(el):
+                                return el
+                        except Exception:  # noqa: BLE001
+                            continue
+                except Exception:  # noqa: BLE001
+                    continue
+            return None
+
+        box, dialog = None, None
+        try:
+            dialogs = page.get_by_role("dialog").all()
+        except Exception:  # noqa: BLE001
+            dialogs = []
+        for d in dialogs:
+            try:
+                if not d.is_visible():
+                    continue
+                el = _find_editor(d)
+                if el is not None:
+                    dialog = d
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+
+        # 2b. Chuyển danh tính sang Fanpage nếu được yêu cầu.
+        #     Làm TRƯỚC khi điền nội dung vì đổi danh tính có thể render lại dialog.
+        as_page = ""
+        detail = ""
+        if use_fanpage and dialog is not None:
+            ok, detail = self._switch_to_fanpage(page, dialog,
+                                                 rotate=rotate_voice)
+            if ok:
+                as_page = detail
+            page.wait_for_timeout(1000)
+
+        # 3. Tìm khung nhập nội dung (tìm lại sau khi chuyển danh tính)
+        if dialog is not None:
+            box = _find_editor(dialog)
+        if box is None:
+            # fallback cuối: tìm toàn trang (vẫn loại trừ khung bình luận)
+            box = _find_editor(page)
+
+        # 4. Điền nội dung
+        if box is None:
+            raise PostFailed(
+                "Không tìm thấy khung nhập nội dung bài viết "
+                "(hộp thoại đã mở nhưng không thấy khung soạn thảo).")
         box.click()
         box.fill(message)
         page.wait_for_timeout(1200)
 
-        # 3. Bấm nút Đăng
-        btn = self._first_visible(page, "button", ["^Đăng$", "^Post$"], timeout=8000)
+        # 5. Bấm nút Đăng (ưu tiên trong cùng dialog chứa khung soạn)
+        scope_btn = dialog if dialog is not None else page
+        btn = None
+        for pat in ["^Đăng$", "^Post$"]:
+            try:
+                el = scope_btn.get_by_role(
+                    "button", name=re.compile(pat, re.I)).first
+                el.wait_for(state="visible", timeout=4000)
+                btn = el
+                break
+            except Exception:  # noqa: BLE001
+                continue
         if btn is not None:
             try:
                 btn.click(timeout=10000)
@@ -264,7 +342,263 @@ class PlaywrightFacebookClient(FacebookClient):
         page.wait_for_timeout(5000)
 
         post_id = self._extract_post_id(page.content() or "")
-        return {"post_id": post_id or f"pw_{group_id}_{int(time.time())}"}
+        return {"post_id": post_id or f"pw_{group_id}_{int(time.time())}",
+                "as_page": as_page,
+                "fanpage_error": "" if as_page else detail}
+
+    def _switch_to_fanpage(self, page, dialog, rotate=False):
+        """Trong dialog Tạo bài viết: chuyển danh tính đăng sang Fanpage.
+
+        Trả về (True, tên_page) nếu chuyển được, (False, lý_do) nếu không.
+        Không raise — caller sẽ đăng tiếp bằng nick cá nhân nếu thất bại.
+        """
+        # B1: tìm nút mở bảng chọn danh tính trong dialog
+        switcher = None
+        for pat in ["Chọn hồ sơ", "Đăng với tư cách", "Chuyển sang",
+                    "Đổi hồ sơ", "Giọng nói", "chuyển trang cá nhân",
+                    "Choose profile", "Post as", "Switch profile",
+                    "Current voice"]:
+            try:
+                for el in dialog.get_by_role(
+                        "button", name=re.compile(pat, re.I)).all():
+                    try:
+                        if el.is_visible():
+                            switcher = el
+                            break
+                    except Exception:  # noqa: BLE001
+                        continue
+                if switcher is not None:
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        if switcher is None:
+            return False, "không tìm thấy nút chuyển danh tính trong hộp thoại"
+        try:
+            switcher.click(timeout=8000)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"bấm nút chuyển danh tính thất bại: {exc}"
+        page.wait_for_timeout(1500)
+        target = self._next_voice_target(page) if rotate else None
+        return self._pick_identity_from_chooser(page, target_name=target)
+
+    @staticmethod
+    def _read_chooser_identities(page):
+        """Doc danh sach (element, ten) tu bang chon danh tinh dang mo.
+        Ho tro kieu menu va kieu dialog. Tra ve list (rong neu khong doc duoc)."""
+        options = []
+        for role in ["menuitem", "menuitemradio", "option"]:
+            try:
+                for it in page.get_by_role(role).all():
+                    try:
+                        if not it.is_visible():
+                            continue
+                        name = (it.inner_text(timeout=2000) or "").strip()
+                        if name:
+                            options.append((it, name.split(chr(10))[0].strip()))
+                    except Exception:  # noqa: BLE001
+                        continue
+            except Exception:  # noqa: BLE001
+                continue
+        if options:
+            return options
+        try:
+            dlg = page.get_by_role(
+                "dialog",
+                name=re.compile("Trang & trang cá nhân|Pages and profiles",
+                                re.I)).first
+            dlg.wait_for(state="visible", timeout=5000)
+        except Exception:  # noqa: BLE001
+            return []
+        rows = []
+        try:
+            btns = dlg.get_by_role("button").all()
+        except Exception:  # noqa: BLE001
+            btns = []
+        for btn in btns:
+            try:
+                if not btn.is_visible():
+                    continue
+                name = (btn.inner_text(timeout=2000) or "").strip()
+                if not name:
+                    continue
+                first_line = name.split(chr(10))[0].strip()
+                low = first_line.lower()
+                if any(k in low for k in ["tạo", "create", "cài đặt",
+                                         "setting", "chuyển tài khoản",
+                                         "switch account", "tìm hiểu",
+                                         "learn more", "đóng", "close"]):
+                    continue
+                rows.append((btn, first_line))
+            except Exception:  # noqa: BLE001
+                continue
+        return rows
+
+    @staticmethod
+    def _click_identity(page, el, pname):
+        try:
+            el.click(timeout=8000)
+        except Exception as exc:  # noqa: BLE001
+            return False, "bam chon ho so that bai: %s" % exc
+        page.wait_for_timeout(1500)
+        return True, pname
+
+    def _next_voice_target(self, page):
+        """Ten profile tiep theo de xoay vong (doc danh sach o lan dau).
+        Bo muc dau (danh tinh hien tai luc doc). Tra ve None neu khong co."""
+        if self._voice_names is None:
+            identities = self._read_chooser_identities(page)
+            self._voice_names = [nm for idx, (el, nm) in enumerate(identities)
+                                 if idx > 0]
+        if not self._voice_names:
+            return None
+        target = self._voice_names[self._voice_idx % len(self._voice_names)]
+        self._voice_idx += 1
+        return target
+
+    def _pick_identity_from_chooser(self, page, target_name=None):
+        """Chon ho so trong bang chon danh tinh dang mo.
+        target_name=None -> lay muc dau tien khac danh tinh hien tai."""
+        identities = self._read_chooser_identities(page)
+        if not identities:
+            try:
+                page.keyboard.press("Escape")
+            except Exception:  # noqa: BLE001
+                pass
+            return False, "không tìm thấy bảng chọn danh tính"
+        if target_name:
+            for el, nm in identities:
+                if nm.lower() == target_name.lower():
+                    return self._click_identity(page, el, nm)
+            return False, "không thấy '%s' trong bảng chọn" % target_name
+        cands = [(el, nm) for idx, (el, nm) in enumerate(identities)
+                 if idx > 0 and "cá nhân" not in nm.lower()
+                 and "personal" not in nm.lower()]
+        if not cands:
+            return False, "không tìm thấy hồ sơ/Page khác trong bảng chọn"
+        el, pname = cands[0]
+        return self._click_identity(page, el, pname)
+
+    def _switch_comment_to_page(self, page, box, rotate=False):
+        """Chuyển danh tính bình luận sang Fanpage.
+
+        Nút chuyển là avatar có aria-label "Giọng nói hiện có, chuyển trang cá
+        nhân" (Facebook gọi danh tính là "voice"; avatar dạng SVG nên không
+        quét bằng thẻ img được). Trả về (True, tên_page) / (False, lý_do)."""
+        try:
+            bbox = box.bounding_box()
+        except Exception:  # noqa: BLE001
+            bbox = None
+        if bbox is None:
+            return False, "không đo được vị trí khung bình luận"
+        cx = bbox["x"] + bbox["width"] / 2
+        cy = bbox["y"] + bbox["height"] / 2
+
+        # Chiến thuật A: nút "voice" gần khung comment nhất
+        switcher = None
+        cands = []
+        for pat in ["giọng nói", "chuyển trang cá nhân", "current voice",
+                    "switch profile"]:
+            try:
+                els = page.get_by_role(
+                    "button", name=re.compile(pat, re.I)).all()
+            except Exception:  # noqa: BLE001
+                continue
+            for el in els:
+                try:
+                    if not el.is_visible():
+                        continue
+                    bb = el.bounding_box()
+                    if not bb:
+                        continue
+                    dist = (abs(bb["x"] + bb["width"] / 2 - cx)
+                            + abs(bb["y"] + bb["height"] / 2 - cy))
+                    cands.append((dist, el))
+                except Exception:  # noqa: BLE001
+                    continue
+        if cands:
+            cands.sort(key=lambda t: t[0])
+            switcher = cands[0][1]
+
+        # Chiến thuật B (dự phòng): nút bọc ngoài ảnh avatar gần khung
+        if switcher is None:
+            try:
+                scope = box.locator("xpath=ancestor::div[8]")
+                imgs = scope.locator("img").all() or page.locator("img").all()
+            except Exception:  # noqa: BLE001
+                try:
+                    imgs = page.locator("img").all()
+                except Exception:  # noqa: BLE001
+                    imgs = []
+            img_cands = []
+            for im in imgs:
+                try:
+                    bb = im.bounding_box()
+                    if not bb:
+                        continue
+                    w, h = bb["width"], bb["height"]
+                    if w > 120 or h > 120 or w < 16 or h < 16:
+                        continue
+                    bx, by = bb["x"] + w / 2, bb["y"] + h / 2
+                    if bx < bbox["x"] + 10 and abs(by - cy) < 60:
+                        img_cands.append((abs(bx - cx) + abs(by - cy), im))
+                except Exception:  # noqa: BLE001
+                    continue
+            if img_cands:
+                img_cands.sort(key=lambda t: t[0])
+                _, im = img_cands[0]
+                for target in (im.locator("xpath=.."),
+                               im.locator("xpath=../..")):
+                    try:
+                        if target.is_visible():
+                            switcher = target
+                            break
+                    except Exception:  # noqa: BLE001
+                        continue
+
+        if switcher is None:
+            return False, "không tìm thấy nút chuyển danh tính cạnh khung bình luận"
+        before = self._count_menu_items(page)
+        try:
+            switcher.click(timeout=8000)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"bấm nút chuyển danh tính thất bại: {exc}"
+        page.wait_for_timeout(1500)
+        if not self._is_chooser_open(page, before):
+            return False, "bấm nút chuyển nhưng bảng chọn không mở"
+        target = self._next_voice_target(page) if rotate else None
+        return self._pick_identity_from_chooser(page, target_name=target)
+
+
+    @staticmethod
+    def _is_chooser_open(page, before):
+        """Kiem tra bang chon danh tinh co mo khong: so muc menu tang len
+        hoac dialog 'Trang & trang ca nhan' xuat hien."""
+        if PlaywrightFacebookClient._count_menu_items(page) > before:
+            return True
+        try:
+            dlg = page.get_by_role(
+                "dialog",
+                name=re.compile("Trang & trang cá nhân|Pages and profiles",
+                                re.I)).first
+            return dlg.is_visible()
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _count_menu_items(page):
+        """Đếm số mục chọn (menuitem/option) đang hiển thị trên trang."""
+        n = 0
+        for role in ["menuitem", "menuitemradio", "option"]:
+            try:
+                for it in page.get_by_role(role).all():
+                    try:
+                        if it.is_visible():
+                            n += 1
+                    except Exception:  # noqa: BLE001
+                        continue
+            except Exception:  # noqa: BLE001
+                continue
+        return n
 
     @staticmethod
     def _find_comment_box(page, timeout=12000):
@@ -324,16 +658,23 @@ class PlaywrightFacebookClient(FacebookClient):
         except Exception:  # noqa: BLE001
             return None
 
-    def comment(self, post_id, message):
+    def comment(self, post_id, message, use_fanpage=False,
+                rotate_voice=False):
         self.ensure_login()
         self._ensure_browser()
         page = self._page
-        fbid = str(post_id).split("_")[-1]
-        if str(post_id).startswith("pw_") or str(post_id).startswith("mfb_"):
-            raise PostFailed(
-                "Không comment được: ID bài viết không hợp lệ "
-                "(bài đăng ở chế độ trình duyệt chưa lấy được ID thật).")
-        page.goto(f"https://www.facebook.com/{fbid}",
+        pid_str = str(post_id).strip()
+        if pid_str.startswith("http://") or pid_str.startswith("https://"):
+            target_url = pid_str  # link day du (vd. dang pfbid)
+            fbid = "url"
+        else:
+            fbid = pid_str.split("_")[-1]
+            if pid_str.startswith("pw_") or pid_str.startswith("mfb_"):
+                raise PostFailed(
+                    "Không comment được: ID bài viết không hợp lệ "
+                    "(bài đăng ở chế độ trình duyệt chưa lấy được ID thật).")
+            target_url = f"https://www.facebook.com/{fbid}"
+        page.goto(target_url,
                   wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(2500)
 
@@ -343,15 +684,153 @@ class PlaywrightFacebookClient(FacebookClient):
                 "Không tìm thấy khung bình luận (giao diện Facebook có thể "
                 "đã đổi — hãy chụp màn hình trình duyệt lúc báo lỗi để "
                 "mình chỉnh lại selector).")
-        box.click()
-        page.wait_for_timeout(500)
-        box.fill(message)
-        page.wait_for_timeout(800)
-        box.press("Enter")
+
+        # chuyển danh tính bình luận sang Fanpage (làm trước khi điền)
+        as_page = ""
+        detail = ""
+        if use_fanpage:
+            ok, detail = self._switch_comment_to_page(
+                page, box, rotate=rotate_voice)
+            if ok:
+                as_page = detail
+                page.wait_for_timeout(1000)
+            else:
+                # debug: lưu HTML quanh khung comment để phân tích nút chuyển
+                try:
+                    container = box.locator("xpath=ancestor::div[8]")
+                    dbg = f"debug_comment_{fbid}.html"
+                    with open(dbg, "w", encoding="utf-8") as fh:
+                        fh.write(container.inner_html())
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # điền bình luận — tìm lại khung trước mỗi lần thử vì FB có thể
+        # render lại composer sau khi chuyển danh tính (gây "detached")
+        for attempt in range(3):
+            box = self._find_comment_box(page)
+            if box is None:
+                raise PostFailed(
+                    "Không tìm thấy khung bình luận (giao diện Facebook có thể "
+                    "đã đổi).")
+            try:
+                box.click(timeout=6000)
+                page.wait_for_timeout(500)
+                box.fill(message)
+                page.wait_for_timeout(800)
+                box.press("Enter")
+                break
+            except Exception as exc:  # noqa: BLE001
+                if attempt == 2:
+                    raise PostFailed(
+                        f"Không điền được bình luận sau 3 lần thử: {exc}")
+                page.wait_for_timeout(1500)
         page.wait_for_timeout(3500)
+        if self._dismiss_profile_block_dialog(page):
+            raise PostFailed(
+                "Facebook chặn: mỗi bài chỉ cho 1 profile tương tác. "
+                "Hãy dùng cùng 1 profile cho bài này (tắt xoay vòng).")
 
         comment_id = self._extract_post_id(page.content() or "")
-        return {"comment_id": comment_id or f"c_{int(time.time())}"}
+        return {"comment_id": comment_id or f"c_{int(time.time())}",
+                "as_page": as_page,
+                "fanpage_error": "" if as_page else detail}
+
+    @staticmethod
+    def _dismiss_profile_block_dialog(page):
+        """Phat hien va tat dialog 'Chuyen trang ca nhan de tuong tac'
+        (Facebook chi cho 1 profile tuong tac voi 1 bai viet).
+        Tra ve True neu da phat hien + tat."""
+        try:
+            dlg = page.get_by_role(
+                "dialog",
+                name=re.compile("Chuyển trang cá nhân để tương tác|"
+                                "Switch profile to interact", re.I)).first
+            if not dlg.is_visible():
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+        for pat in ["^OK$", "Đóng", "^Close$"]:
+            try:
+                btn = dlg.get_by_role("button", name=re.compile(pat, re.I)).first
+                if btn.is_visible():
+                    btn.click(timeout=3000)
+                    page.wait_for_timeout(800)
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(500)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def like(self, post_id, use_fanpage=False, rotate_voice=False):
+        """Thả like cho bài viết (dùng voice hiện tại hoặc chuyển sang Page).
+        Trả về {"liked": True, "as_page": ..., "already": ...}."""
+        self.ensure_login()
+        self._ensure_browser()
+        page = self._page
+        pid_str = str(post_id).strip()
+        if pid_str.startswith("http://") or pid_str.startswith("https://"):
+            target_url = pid_str
+        else:
+            fbid = pid_str.split("_")[-1]
+            if pid_str.startswith("pw_") or pid_str.startswith("mfb_"):
+                raise PostFailed(
+                    "Không like được: ID bài viết không hợp lệ.")
+            target_url = f"https://www.facebook.com/{fbid}"
+        page.goto(target_url,
+                  wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(2500)
+
+        # chuyển voice sang Page nếu được yêu cầu (dùng nút voice ở khung comment)
+        as_page = ""
+        detail = ""
+        if use_fanpage:
+            box = self._find_comment_box(page)
+            if box is not None:
+                ok, detail = self._switch_comment_to_page(
+                    page, box, rotate=rotate_voice)
+                if ok:
+                    as_page = detail
+                    page.wait_for_timeout(1000)
+
+        # nút Thích của bài viết: ưu tiên trong dialog, lấy nút đầu tiên
+        # (thanh action của bài nằm trước các bình luận trong DOM)
+        try:
+            dialogs = page.get_by_role("dialog").all()
+            scope = dialogs[0] if dialogs else page
+        except Exception:  # noqa: BLE001
+            scope = page
+        like_btn = None
+        for pat in ["^Thích$", "^Like$"]:
+            try:
+                btn = scope.get_by_role(
+                    "button", name=re.compile(pat, re.I)).first
+                btn.wait_for(state="visible", timeout=5000)
+                like_btn = btn
+                break
+            except Exception:  # noqa: BLE001
+                continue
+        if like_btn is None:
+            raise PostFailed("Không tìm thấy nút Thích của bài viết.")
+        # đã like rồi thì bỏ qua để không bấm thành unlike
+        try:
+            if like_btn.get_attribute("aria-pressed") == "true":
+                return {"liked": True, "as_page": as_page, "already": True}
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            like_btn.click(timeout=8000)
+        except Exception as exc:  # noqa: BLE001
+            raise PostFailed(f"Bấm nút Thích thất bại: {exc}")
+        page.wait_for_timeout(1500)
+        if self._dismiss_profile_block_dialog(page):
+            raise PostFailed(
+                "Facebook chặn: mỗi bài chỉ cho 1 profile tương tác. "
+                "Hãy dùng cùng 1 profile cho bài này (tắt xoay vòng).")
+        return {"liked": True, "as_page": as_page, "already": False}
 
     def get_group_info(self, group_id):
         self.ensure_login()

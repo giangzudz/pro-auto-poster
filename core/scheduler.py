@@ -21,6 +21,7 @@ class PostJob:
     auto_comment: bool = True
     comment_text: str = ""
     use_fanpage: bool = False
+    rotate_voice: bool = False
     headless: bool = False
 
 
@@ -73,12 +74,35 @@ class Scheduler:
                 variables = {"group_name": gname, "group_id": gid, "index": idx}
                 message = spinner.render(job.content, variables)
                 try:
-                    result = client.post_to_group(gid, message, job.media)
+                    result = client.post_to_group(gid, message, job.media,
+                                                    use_fanpage=job.use_fanpage,
+                                                    rotate_voice=job.rotate_voice)
                     self.log.success(f"[{idx}/{total}] Đã đăng nhóm {gname}")
+                    if result.get("as_page"):
+                        self.log.info(
+                            f"↳ Đã đăng với tư cách Fanpage: {result['as_page']}.")
+                    elif job.use_fanpage:
+                        err = (result.get("fanpage_error")
+                               if isinstance(result, dict) else "")
+                        self.log.warning(
+                            f"↳ Không chuyển được sang Fanpage ({err}), "
+                            "đã đăng bằng nick cá nhân.")
                     if job.auto_comment and job.comment_text.strip():
                         cmsg = spinner.render(job.comment_text, variables)
-                        client.comment(result.get("post_id"), cmsg)
+                        cresult = client.comment(result.get("post_id"), cmsg,
+                                                 use_fanpage=job.use_fanpage,
+                                                 rotate_voice=job.rotate_voice)
                         self.log.info("↳ Đã tự động comment up bài.")
+                        if isinstance(cresult, dict) and cresult.get("as_page"):
+                            self.log.info(
+                                "↳ Bình luận với tư cách Fanpage: "
+                                f"{cresult['as_page']}.")
+                        elif job.use_fanpage:
+                            err = (cresult.get("fanpage_error")
+                                   if isinstance(cresult, dict) else "")
+                            self.log.warning(
+                                f"↳ Không chuyển được sang Fanpage ({err}), "
+                                "đã bình luận bằng nick cá nhân.")
                     if on_posted:
                         try:
                             on_posted({"id": gid, "name": gname},

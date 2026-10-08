@@ -31,6 +31,7 @@ class AccountManager:
             "display_name": display_name or username,
             "expiry": expiry,  # HSD
             "note": note,
+            "proxy": "",  # proxy riêng: "http://user:pass@host:port", trống = không dùng
             "cookies_file": "",
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "last_login": "",
@@ -43,6 +44,19 @@ class AccountManager:
 
     def get(self, username):
         return self.accounts.get(username)
+
+    def get_proxy(self, username):
+        """Proxy riêng của tài khoản ('' = không dùng)."""
+        return (self.accounts.get(username) or {}).get("proxy", "") or ""
+
+    def set_proxy(self, username, proxy):
+        """Lưu proxy riêng cho tài khoản. Trả về False nếu không có tài khoản."""
+        acc = self.accounts.get(username)
+        if acc is None:
+            return False
+        acc["proxy"] = (proxy or "").strip()
+        self.save()
+        return True
 
     def list(self):
         return list(self.accounts.values())
